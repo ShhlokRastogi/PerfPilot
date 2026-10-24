@@ -75,7 +75,8 @@ class SandboxEnvironment:
         if self.log_file_path and os.path.exists(self.log_file_path):
             try:
                 with open(self.log_file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    lines = f.readlines()
+                    content = f.read().replace("\x00", "")
+                    lines = content.splitlines(keepends=True)
                     return "".join(lines[-max_lines:])
             except Exception:
                 pass
@@ -515,7 +516,8 @@ class SandboxService:
                     raise SandboxExecutionError(error_msg)
 
                 try:
-                    resp = await client.get(f"http://127.0.0.1:{port}/", timeout=1.0)
+                    probe_url = service_url if service_url else f"http://127.0.0.1:{port}/"
+                    resp = await client.get(probe_url, timeout=1.0)
                     if resp.status_code < 500:
                         is_ready = True
                         break
