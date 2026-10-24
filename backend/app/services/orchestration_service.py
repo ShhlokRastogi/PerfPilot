@@ -115,6 +115,7 @@ class OrchestrationService:
                     t0 = time.time()
                     baseline_env = await SandboxService.launch_application_service(
                         workspace_dir=run.repo_path,
+                        source_repo=run.repo_path,
                         target_path_or_url=run.target_url or "/",
                         port=8001,
                         phase_name="baseline",
@@ -275,7 +276,7 @@ class OrchestrationService:
 
                 record_sandbox_step(run.id, "test", "Execute Build & Regression Tests", "running")
                 t0 = time.time()
-                test_results = await SandboxService.run_regression_tests(candidate_dir)
+                test_results = await SandboxService.run_regression_tests(candidate_dir, source_repo=run.repo_path)
                 if not test_results["passed"]:
                     record_sandbox_step(run.id, "test", "Execute Build & Regression Tests", "failed", test_results.get("output", "Tests failed"), duration_ms=round((time.time()-t0)*1000, 1))
                     run.failure_reason = f"Regression tests failed:\n{test_results['output']}"
@@ -300,7 +301,13 @@ class OrchestrationService:
                 # 4. Launch candidate service on isolated port 8002
                 record_sandbox_step(run.id, "launch", "Launch Candidate Sandbox Service", "running")
                 t0 = time.time()
-                candidate_env = await SandboxService.launch_candidate_service(candidate_dir, target_url=run.target_url, port=8002, run_id=run.id)
+                candidate_env = await SandboxService.launch_candidate_service(
+                    candidate_dir,
+                    source_repo=run.repo_path,
+                    target_url=run.target_url,
+                    port=8002,
+                    run_id=run.id
+                )
                 record_sandbox_step(run.id, "launch", "Launch Candidate Sandbox Service", "completed", f"Service responsive at {candidate_env.candidate_url}", duration_ms=round((time.time()-t0)*1000, 1))
 
                 # 5. BENCHMARKING_CANDIDATE

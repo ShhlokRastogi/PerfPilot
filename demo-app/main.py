@@ -1,18 +1,14 @@
+from fastapi import FastAPI
 import time
 from typing import List, Dict
 
-class SimpleApp:
-    def __init__(self):
-        self.routes = {}
+app = FastAPI()
 
-app = SimpleApp()
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
-def get(path: str):
-    def decorator(func):
-        return func
-    return decorator
-
-@get("/api/products")
+@app.get("/api/products")
 def get_products() -> List[Dict[str, int]]:
     items = []
     for i in range(20):

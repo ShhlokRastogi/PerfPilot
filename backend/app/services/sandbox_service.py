@@ -286,10 +286,58 @@ class SandboxService:
         return diff_text
 
     @classmethod
-    async def run_regression_tests(cls, candidate_dir: str) -> Dict[str, Any]:
+    def find_python_interpreter(cls, workspace_dir: str, source_repo: Optional[str] = None) -> Tuple[str, str]:
         """
-        Executes real unit and regression tests in the candidate workspace.
+        Resolves the best Python interpreter to run target application and candidate sandbox.
+        Searches workspace_dir and source_repo up the directory hierarchy (parents)
+        and down (subdirectories) for existing virtual environments (.venv, venv, env).
         """
+        search_roots = []
+        if workspace_dir:
+            search_roots.append(os.path.abspath(workspace_dir))
+        if source_repo and os.path.abspath(source_repo) not in search_roots:
+            search_roots.append(os.path.abspath(source_repo))
+
+        # 1. Check search roots and ancestor directories (up to 4 levels)
+        for root in search_roots:
+            curr = root
+            for _ in range(4):
+                for vname in [".venv", "venv", "env"]:
+                    for sdir, pexe in [("Scripts", "python.exe"), ("bin", "python"), ("bin", "python3")]:
+                        vpath = os.path.join(curr, vname, sdir, pexe)
+                        if os.path.exists(vpath):
+                            return os.path.normpath(vpath), f"Repository Virtualenv ({vname} at {curr})"
+                parent = os.path.dirname(curr)
+                if parent == curr:
+                    break
+                curr = parent
+
+        # 2. Check immediate subdirectories (e.g. root/backend/.venv)
+        for root in search_roots:
+            try:
+                if os.path.exists(root):
+                    for sub in os.listdir(root):
+                        sub_path = os.path.join(root, sub)
+                        if os.path.isdir(sub_path):
+                            for vname in [".venv", "venv", "env"]:
+                                for sdir, pexe in [("Scripts", "python.exe"), ("bin", "python"), ("bin", "python3")]:
+                                    vpath = os.path.join(sub_path, vname, sdir, pexe)
+                                    if os.path.exists(vpath):
+                                        return os.path.normpath(vpath), f"Subdirectory Virtualenv ({sub}/{vname})"
+            except Exception:
+                pass
+
+        # 3. Fallback to PerfPilot host Python interpreter
+        return sys.executable, "PerfPilot Host Python (Fallback - dependencies may be missing)"
+
+    @classmethod
+    async def run_regression_tests(cls, candidate_dir: str, source_repo: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Executes real unit and regression tests in the candidate workspace
+        using the target project's Python virtual environment.
+        """
+        python_bin, _ = cls.find_python_interpreter(candidate_dir, source_repo)
+
         # 1. Check for Python pytest
         has_py_tests = any(
             f.startswith("test_") or f.endswith("_test.py") or f == "tests"
@@ -298,7 +346,7 @@ class SandboxService:
         if has_py_tests or os.path.exists(os.path.join(candidate_dir, "tests")):
             try:
                 proc = await asyncio.create_subprocess_exec(
-                    sys.executable,
+                    python_bin,
                     "-m",
                     "pytest",
                     "-v",
@@ -339,6 +387,7 @@ class SandboxService:
     async def launch_application_service(
         cls,
         workspace_dir: str,
+        source_repo: Optional[str] = None,
         target_path_or_url: str = "/",
         port: int = 8001,
         phase_name: str = "baseline",
@@ -362,13 +411,8 @@ class SandboxService:
         service_url = f"http://127.0.0.1:{port}{path}"
         abs_workspace = os.path.abspath(workspace_dir)
 
-        # Detect Python executable (prefer repository virtualenv if available)
-        python_bin = sys.executable
-        for venv_name in [".venv", "venv", "env"]:
-            vpath = os.path.join(abs_workspace, venv_name, "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
-            if os.path.exists(vpath):
-                python_bin = vpath
-                break
+        # Detect Python executable from workspace or source repo
+        python_bin, venv_desc = cls.find_python_interpreter(abs_workspace, source_repo)
 
         # Check if project root or subfolder (backend/src/api) contains entrypoint
         target_dir = abs_workspace
@@ -414,7 +458,7 @@ class SandboxService:
                 step_id=f"{phase_name}_detect",
                 name=f"Auto-Detect {phase_name.capitalize()} Application Framework",
                 status="completed",
-                output=f"Framework: {framework_desc}\nWorkspace: {target_dir}\nInterpreter: {python_bin}\nCommand: {cmd_str}\nTarget URL: {service_url}"
+                output=f"Framework: {framework_desc}\nWorkspace: {target_dir}\nInterpreter: {python_bin} ({venv_desc})\nCommand: {cmd_str}\nTarget URL: {service_url}"
             )
 
         # Open dedicated log file for live server stdout/stderr
@@ -447,13 +491,29 @@ class SandboxService:
                 output=f"Spawned PID {proc.pid} on port {port}. Waiting for health/readiness..."
             )
 
-        # Poll until responsive
+        # Poll until responsive with early crash detection
         timeout = 15.0
         start = asyncio.get_event_loop().time()
         is_ready = False
 
         async with httpx.AsyncClient() as client:
             while (asyncio.get_event_loop().time() - start) < timeout:
+                # Fast exit check: Did the subprocess terminate prematurely?
+                if proc.poll() is not None:
+                    log_file.flush()
+                    err_logs = env.get_logs(max_lines=30)
+                    error_msg = f"Sandbox process (PID {proc.pid}) crashed with exit code {proc.returncode}.\n\n--- Process Output Logs ---\n{err_logs}"
+                    if run_id:
+                        record_sandbox_step(
+                            run_id=run_id,
+                            step_id=f"{phase_name}_launch",
+                            name=f"Launch {phase_name.capitalize()} Sandbox on Port {port}",
+                            status="failed",
+                            output=error_msg,
+                            duration_ms=(time.time() - t0) * 1000.0
+                        )
+                    raise SandboxExecutionError(error_msg)
+
                 try:
                     resp = await client.get(f"http://127.0.0.1:{port}/", timeout=1.0)
                     if resp.status_code < 500:
@@ -463,11 +523,26 @@ class SandboxService:
                     pass
                 await asyncio.sleep(0.4)
 
+        if not is_ready:
+            log_file.flush()
+            err_logs = env.get_logs(max_lines=30)
+            error_msg = f"Sandbox service on port {port} failed to become responsive within {timeout:.0f}s.\n\n--- Process Output Logs ---\n{err_logs}"
+            if run_id:
+                record_sandbox_step(
+                    run_id=run_id,
+                    step_id=f"{phase_name}_launch",
+                    name=f"Launch {phase_name.capitalize()} Sandbox on Port {port}",
+                    status="failed",
+                    output=error_msg,
+                    duration_ms=(time.time() - t0) * 1000.0
+                )
+            raise SandboxExecutionError(error_msg)
+
         elapsed_ms = (time.time() - t0) * 1000.0
         initial_logs = env.get_logs(max_lines=30)
 
         if run_id:
-            readiness_note = f"Service responded ready on port {port} in {elapsed_ms:.0f}ms." if is_ready else f"Service process spawned (PID {proc.pid}); warm-up continuing."
+            readiness_note = f"Service responded ready on port {port} in {elapsed_ms:.0f}ms."
             record_sandbox_step(
                 run_id=run_id,
                 step_id=f"{phase_name}_launch",
@@ -483,6 +558,7 @@ class SandboxService:
     async def launch_candidate_service(
         cls,
         candidate_dir: str,
+        source_repo: Optional[str] = None,
         target_url: str = "/",
         port: int = 8002,
         **kwargs
@@ -491,6 +567,7 @@ class SandboxService:
         run_id = kwargs.get("run_id")
         return await cls.launch_application_service(
             workspace_dir=candidate_dir,
+            source_repo=source_repo,
             target_path_or_url=target_url,
             port=port,
             phase_name="candidate",
